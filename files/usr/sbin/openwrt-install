@@ -1,0 +1,240 @@
+#!/bin/sh
+# OpenWrt VM Disk Installer
+# Installs OpenWrt x86_64 to the virtual machine disk and expands rootfs.
+
+set -e
+
+AUTO_MODE=0
+TARGET_DISK=""
+IMAGE_PATH="/opt/openwrt-install/openwrt-image.img.gz"
+
+for arg in "$@"; do
+    case "$arg" in
+        --auto|-y)
+            AUTO_MODE=1
+            ;;
+        --disk=*)
+            TARGET_DISK="${arg#*=}"
+            ;;
+        --help|-h)
+            echo "Usage: openwrt-install [--auto] [--disk=/dev/sdX]"
+            echo "  --auto, -y       Unattended installation (no interactive prompts)"
+            echo "  --disk=/dev/sdX  Target disk to install OpenWrt onto"
+            exit 0
+            ;;
+    esac
+done
+
+echo "=============================================================="
+echo "               OpenWrt VM Disk Installer"
+echo "=============================================================="
+
+# Check for bundled image
+if [ ! -f "$IMAGE_PATH" ]; then
+    # Fallback search on boot media or temporary directories
+    for p in /opt/openwrt-install/*.img.gz /opt/*.img.gz /tmp/*.img.gz; do
+        if [ -f "$p" ]; then
+            IMAGE_PATH="$p"
+            break
+        fi
+    done
+fi
+
+if [ ! -f "$IMAGE_PATH" ]; then
+    echo "ERROR: OpenWrt disk image not found at $IMAGE_PATH" >&2
+    exit 1
+fi
+
+echo "Found OpenWrt image: $IMAGE_PATH"
+
+# Discover available hard disks
+find_disks() {
+    for b in /sys/block/*; do
+        dev=$(basename "$b")
+        case "$dev" in
+            loop*|sr*|ram*|dm-*|zram*)
+                continue
+                ;;
+        esac
+        # Ensure it's a physical/virtual disk block device
+        if [ -d "$b" ] && [ -f "$b/size" ]; then
+            size_sectors=$(cat "$b/size" 2>/dev/null || echo 0)
+            if [ "$size_sectors" -gt 0 ]; then
+                # Size in GB (approx)
+                size_mb=$(( size_sectors / 2048 ))
+                size_gb=$(( size_mb / 1024 ))
+                model="Virtual Disk"
+                if [ -f "$b/device/model" ]; then
+                    model=$(cat "$b/device/model" | tr -s ' ' | sed 's/^[ \t]*//;s/[ \t]*$//')
+                fi
+                echo "/dev/$dev|$size_gb GB ($size_mb MB)|$model"
+            fi
+        fi
+    done
+}
+
+DISKS=$(find_disks)
+
+if [ -z "$DISKS" ]; then
+    echo "ERROR: No available hard disk detected in this VM!" >&2
+    echo "Please ensure a virtual hard disk (VirtIO, SCSI, or SATA) is attached." >&2
+    exit 1
+fi
+
+# Count candidate disks
+DISK_COUNT=$(echo "$DISKS" | wc -l)
+
+if [ -n "$TARGET_DISK" ]; then
+    if [ ! -b "$TARGET_DISK" ]; then
+        echo "ERROR: Specified target disk $TARGET_DISK is not a block device!" >&2
+        exit 1
+    fi
+elif [ "$DISK_COUNT" -eq 1 ]; then
+    TARGET_DISK=$(echo "$DISKS" | cut -d'|' -f1)
+    DISK_DESC=$(echo "$DISKS" | cut -d'|' -f2,3 | tr '|' ' ')
+    echo "Detected single virtual hard disk: $TARGET_DISK [$DISK_DESC]"
+else
+    echo "Multiple disks detected:"
+    i=1
+    echo "$DISKS" | while IFS='|' read -r d s m; do
+        echo "  $i) $d - $s - $m"
+        i=$((i + 1))
+    done
+
+    if [ "$AUTO_MODE" -eq 1 ]; then
+        TARGET_DISK=$(echo "$DISKS" | head -n1 | cut -d'|' -f1)
+        echo "Auto mode: Selected primary disk $TARGET_DISK"
+    else
+        printf "Select disk number to install OpenWrt onto (1-%d): " "$DISK_COUNT"
+        read -r choice
+        TARGET_DISK=$(echo "$DISKS" | sed -n "${choice}p" | cut -d'|' -f1)
+        if [ -z "$TARGET_DISK" ]; then
+            echo "Invalid selection. Aborting." >&2
+            exit 1
+        fi
+    fi
+fi
+
+echo ""
+echo "Selected target disk: $TARGET_DISK"
+echo "WARNING: ALL DATA ON $TARGET_DISK WILL BE COMPLETELY DESTROYED!"
+echo ""
+
+if [ "$AUTO_MODE" -ne 1 ]; then
+    printf "Are you sure you want to proceed? [y/N]: "
+    read -r confirm
+    case "$confirm" in
+        [yY]|[yY][eE][sS])
+            ;;
+        *)
+            echo "Installation cancelled by user."
+            exit 0
+            ;;
+    esac
+fi
+
+echo ""
+echo "-> Step 1/4: Writing OpenWrt system image to $TARGET_DISK..."
+
+# Determine supported dd options for BusyBox vs GNU coreutils dd
+if dd --help 2>&1 | grep -q "status=progress"; then
+    gunzip -c "$IMAGE_PATH" | dd of="$TARGET_DISK" bs=4M status=progress conv=fsync 2>/dev/null || \
+    gunzip -c "$IMAGE_PATH" | dd of="$TARGET_DISK" bs=4M
+elif dd --help 2>&1 | grep -q "fsync"; then
+    gunzip -c "$IMAGE_PATH" | dd of="$TARGET_DISK" bs=4M conv=fsync 2>/dev/null || \
+    gunzip -c "$IMAGE_PATH" | dd of="$TARGET_DISK" bs=4M
+else
+    # Busybox dd without GNU extensions: simple block size or direct stream
+    gunzip -c "$IMAGE_PATH" | dd of="$TARGET_DISK" bs=4096k 2>/dev/null || \
+    gunzip -c "$IMAGE_PATH" > "$TARGET_DISK"
+fi
+sync
+
+echo ""
+echo "-> Step 2/4: Re-reading partition table..."
+blockdev --rereadpt "$TARGET_DISK" 2>/dev/null || partx -u "$TARGET_DISK" 2>/dev/null || true
+sleep 2
+
+# Determine partition naming convention (e.g. sda2 vs nvme0n1p2)
+case "$TARGET_DISK" in
+    *[0-9])
+        ROOT_PART="${TARGET_DISK}p2"
+        ;;
+    *)
+        ROOT_PART="${TARGET_DISK}2"
+        ;;
+esac
+
+echo "-> Step 3/4: Expanding root partition to fill $TARGET_DISK..."
+# If parted is available, use it to fix GPT and resize partition 2 to 100%
+if command -v parted >/dev/null 2>&1; then
+    parted -s "$TARGET_DISK" ---pretend-input-tty print >/dev/null 2>&1 || true
+    parted -s "$TARGET_DISK" -- resizepart 2 100% 2>/dev/null || true
+elif command -v fdisk >/dev/null 2>&1; then
+    # MBR / GPT fallback with fdisk/sfdisk if parted is absent
+    if command -v sfdisk >/dev/null 2>&1; then
+        echo ", +" | sfdisk -N 2 --no-reread "$TARGET_DISK" 2>/dev/null || true
+    fi
+fi
+
+blockdev --rereadpt "$TARGET_DISK" 2>/dev/null || partx -u "$TARGET_DISK" 2>/dev/null || true
+sleep 1
+
+echo "-> Step 4/5: Resizing ext4 filesystem on $ROOT_PART..."
+if [ -b "$ROOT_PART" ]; then
+    if command -v resize2fs >/dev/null 2>&1; then
+        e2fsck -fy "$ROOT_PART" >/dev/null 2>&1 || true
+        resize2fs "$ROOT_PART"
+    else
+        echo "Notice: resize2fs not found in path, skipping online filesystem expansion."
+    fi
+else
+    echo "Notice: $ROOT_PART not immediately visible, kernel will resize on first boot."
+fi
+
+echo "-> Step 5/5: Configuring network on target disk (DHCP client for VM)..."
+mkdir -p /mnt/target
+if mount "$ROOT_PART" /mnt/target 2>/dev/null; then
+    mkdir -p /mnt/target/etc/uci-defaults
+    cat << 'UCIEOF' > /mnt/target/etc/uci-defaults/99-vm-dhcp
+#!/bin/sh
+uci batch <<'EOF'
+set network.lan.proto='dhcp'
+delete network.lan.ipaddr
+delete network.lan.netmask
+set dhcp.lan.ignore='1'
+commit network
+commit dhcp
+EOF
+exit 0
+UCIEOF
+    chmod +x /mnt/target/etc/uci-defaults/99-vm-dhcp
+    sync
+    umount /mnt/target 2>/dev/null || true
+fi
+
+sync
+
+echo ""
+echo "=============================================================="
+echo "         OpenWrt Installation Completed Successfully!         "
+echo "=============================================================="
+echo "Target disk: $TARGET_DISK"
+echo "Root filesystem expanded to full capacity."
+echo "Network mode: DHCP Client (joins your local subnet e.g. 192.168.100.x)"
+echo ""
+echo "Next steps:"
+echo "1. Unmount / disconnect the ISO from your VM CD-ROM settings."
+echo "2. Reboot the virtual machine."
+echo "3. Open http://<assigned-ip> to access the LuCI web interface."
+echo "=============================================================="
+
+if [ "$AUTO_MODE" -eq 1 ]; then
+    echo "Auto mode: Rebooting in 3 seconds..."
+    sleep 3
+    reboot
+else
+    printf "Press [Enter] to reboot now (or Ctrl+C to stay in rescue shell): "
+    read -r _
+    reboot
+fi

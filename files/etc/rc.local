@@ -1,0 +1,9 @@
+# Put your custom commands here that should be executed once
+# the system init finished. By default this file does nothing.
+
+if grep -q "openwrt_installer=auto" /proc/cmdline 2>/dev/null; then
+    echo "Initiating unattended OpenWrt VM installation..." > /dev/kmsg
+    ( /usr/sbin/openwrt-install --auto 2>&1 | tee /dev/tty1 /dev/ttyS0 /dev/console ) &
+fi
+
+exit 0

@@ -1,0 +1,8 @@
+.build/
+.cache/
+dist/
+files/opt/openwrt-install/openwrt-image.img.gz
+*.iso
+*.qcow2
+*.log
+*.ppm
