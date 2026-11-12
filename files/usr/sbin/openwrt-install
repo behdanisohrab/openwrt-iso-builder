@@ -165,16 +165,13 @@ case "$TARGET_DISK" in
         ;;
 esac
 
-echo "-> Step 3/4: Expanding root partition to fill $TARGET_DISK..."
-# If parted is available, use it to fix GPT and resize partition 2 to 100%
-if command -v parted >/dev/null 2>&1; then
-    parted -s "$TARGET_DISK" ---pretend-input-tty print >/dev/null 2>&1 || true
+echo "-> Step 3/5: Expanding root partition to fill $TARGET_DISK..."
+# Use sfdisk first as it automatically fixes GPT PMBR and moves backup GPT to end of disk
+if command -v sfdisk >/dev/null 2>&1; then
+    echo ", +" | sfdisk -N 2 --no-reread "$TARGET_DISK" 2>/dev/null || true
+elif command -v parted >/dev/null 2>&1; then
+    printf "OK\nFix\n" | parted ---pretend-input-tty "$TARGET_DISK" print >/dev/null 2>&1 || true
     parted -s "$TARGET_DISK" -- resizepart 2 100% 2>/dev/null || true
-elif command -v fdisk >/dev/null 2>&1; then
-    # MBR / GPT fallback with fdisk/sfdisk if parted is absent
-    if command -v sfdisk >/dev/null 2>&1; then
-        echo ", +" | sfdisk -N 2 --no-reread "$TARGET_DISK" 2>/dev/null || true
-    fi
 fi
 
 blockdev --rereadpt "$TARGET_DISK" 2>/dev/null || partx -u "$TARGET_DISK" 2>/dev/null || true
